@@ -1,0 +1,27 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+peewee = "*"
+flask = "*"
+gunicorn = "*"
+psycopg2 = "*"
+flask-validate-json = "*"
+flask-cors = "*"
+pyjwt = "*"
+kavenegar = "*"
+celery = {extras = ["redis"], version = "*"}
+redis = "*"
+mailjet-rest = "*"
+flask-expects-json = "==1.6.0"
+
+[dev-packages]
+flake8 = "*"
+rope = "*"
+black = "==21.7b0"
+jedi = "*"
+
+[requires]
+python_version = "3.9"

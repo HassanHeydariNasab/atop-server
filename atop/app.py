@@ -1,0 +1,252 @@
+import os
+from string import digits
+from random import choices
+from datetime import datetime
+from types import List
+
+import jwt
+from flask import Flask, request, jsonify, make_response
+from flask_expects_json import expects_json
+from jsonschema import ValidationError
+from flask_cors import CORS
+from peewee import IntegrityError
+from playhouse.shortcuts import model_to_dict
+from kavenegar import KavenegarAPI, APIException, HTTPException
+from celery import Celery
+
+from .configs import DEBUG, SECRET, KAVENEGAR_APIKEY, KAVENEGAR_VERIFICATION_TEMPLATE
+from .models import User, Post
+from .db import db
+from .email import send_email as _send_email
+from .middlewares import auth
+
+
+app = Flask(__name__)
+CORS(app)
+app.jinja_env.trim_blocks = True
+app.jinja_env.lstrip_blocks = True
+app.config.update(
+    CELERY_BROKER_URL="redis://localhost:6379/1",
+    CELERY_RESULT_BACKEND="redis://localhost:6379/1",
+)
+if DEBUG:
+    os.environ["FLASK_ENV"] = "development"
+# app.logger.debug("DEBUG")
+# app.logger.warning("WARN")
+# app.logger.error("ERROR")
+
+celery = Celery(
+    app.import_name,
+    backend=app.config["CELERY_RESULT_BACKEND"],
+    broker=app.config["CELERY_BROKER_URL"],
+)
+celery.conf.update(app.config)
+
+
+class ContextTask(celery.Task):
+    def __call__(self, *args, **kwargs):
+        with app.app_context():
+            return self.run(*args, **kwargs)
+
+
+celery.Task = ContextTask
+
+
+@celery.task(bind=True)
+def send_email(self, **kwargs):
+    _send_email(**kwargs)
+
+
+@app.errorhandler(400)
+def bad_request(error):
+    if isinstance(error.description, ValidationError):
+        original_error = error.description
+        return make_response(jsonify({"message": original_error.message}), 400)
+    # handle other "Bad Request"-errors
+    return error
+
+
+@app.route("/v1/hello", methods=["GET"])
+def hello():
+    return "hello"
+
+
+@app.route("/v1/users", methods=["POST"])
+@expects_json(
+    {
+        "type": "object",
+        "properties": {
+            "countryCode": {"type": "string", "pattern": r"^\+\d{2,8}$"},
+            "mobile": {"type": "string", "pattern": r"^\d{6,24}$"},
+        },
+        "required": ["countryCode", "mobile"],
+    }
+)
+def createUser():
+    j: dict = request.get_json()
+    verificationCode: str = "".join(choices(digits, k=4))
+    try:
+        User.insert(
+            countryCode=j["countryCode"],
+            mobile=j["mobile"],
+            verificationCode=verificationCode,
+            name="",
+            coins=25,
+        ).execute()
+    except IntegrityError as error:
+        return {"message": "database error"}, 409
+
+    try:
+        api = KavenegarAPI(KAVENEGAR_APIKEY)
+        params = {
+            "receptor": j["countryCode"] + j["mobile"],
+            "token": verificationCode,
+            "template": KAVENEGAR_VERIFICATION_TEMPLATE,
+        }
+        response = api.verify_lookup(params)
+        print(response)
+    # except APIException as e:
+    #    print(e)
+    #    return jsonify({"message": "sms failed"}), 500
+    # except HTTPException as e:
+    #    print(e)
+    #    return jsonify({"message": "sms failed"}), 500
+    # except Exception as e:
+    #    print(e)
+    #    return jsonify({"message": "sms failed"}), 500
+    except Exception as e:
+        print(e)
+        return {}, 201
+
+    return {}, 201
+
+
+@app.route("/v1/users/current", methods=["PATCH"])
+@expects_json(
+    {
+        "type": "object",
+        "properties": {
+            "countryCode": {"type": "string", "pattern": r"^\+\d{2,8}$"},
+            "mobile": {"type": "string", "pattern": r"^\d{6,24}$"},
+            "verificationCode": {"type": "string", "minLength": 1},
+        },
+        "required": ["countryCode", "mobile", "verificationCode"],
+    }
+)
+def verifyUser():
+    j: dict = request.get_json()
+    if request.args.get("action") == "verify":
+        try:
+            user: User = User.get(
+                User.countryCode == j["countryCode"],
+                User.mobile == j["mobile"],
+                User.verificationCode == j["verificationCode"],
+            )
+        except User.DoesNotExist:
+            return {"message": "Verification code is not valid."}, 403
+        User.update({User.verificationCode: None}).where(User.id == user.id).execute()
+        token = jwt.encode({"id": user.id}, SECRET, algorithm="HS256")
+        _user = model_to_dict(user)
+        return {"user": _user, "token": token}, 200
+    else:
+        return {"message": "actionis required as GET query string."}, 400
+
+
+@app.route("/v1/users/current", methods=["GET"])
+@auth
+def showUser(userId):
+    try:
+        user: User = User.get(User.id == userId)
+    except User.DoesNotExist:  # noqa: E722
+        return {"message": "not found"}, 404
+
+    _user: dict = model_to_dict(user)
+
+    return _user, 200
+
+
+@app.route("/v1/posts", methods=["POST"])
+@auth
+@expects_json(
+    {
+        "type": "object",
+        "properties": {
+            "text": {"type": "string", "minLength": 1, "maxLength": 1000},
+        },
+        "required": ["text"],
+    }
+)
+def createPost(userId):
+    j: dict = request.get_json()
+    with db.atomic() as transaction:
+        updated: List[User] = list(
+            User.update({User.coins: User.coins - 10})
+            .where(User.id == userId, User.coins >= 10)
+            .returning(User)
+            .execute()
+        )
+        if len(updated) != 1:
+            transaction.rollback()
+            return {"message": "not enough coins"}, 402
+        postId: int = Post.insert(
+            user=userId, text=j["text"], userName=updated[0].name
+        ).execute()
+
+    return {"id": postId}, 201
+
+
+@app.route("/v1/posts", methods=["GET"])
+@auth
+def showPosts(userId):
+    try:
+        limit: int = request.args.get("limit", 10, int)
+        offset: int = request.args.get("offset", 0, int)
+    except ValueError:
+        return {"message": "limit or offset is invalid."}, 400
+    posts: List[Post] = list(
+        Post.select(Post.userName, Post.user, Post.text, Post.liked)
+        .where(Post.isActive == True)
+        .limit(limit)
+        .offset(offset)
+        .dicts()
+    )
+    return posts, 200
+
+
+@app.route("/v1/posts/{postId}", methods=["PATCH"])
+@auth
+def editPost(userId, postId):
+    with db.atomic() as transaction:
+        action = request.args.get('action')
+        if (action is None):
+            return {"message": "action is required as GET query string."}, 400
+        if (action == "like"):
+            updatedUsers: int = (
+                User.update({User.coins: User.coins - 1})
+                .where(User.id == userId, User.coins >= 1)
+                .execute()
+            )
+            if updatedUsers != 1:
+                transaction.rollback()
+                return {"message": "not enough coins"}, 402
+            updatedPosts: List[Post] = list(
+                Post.update({Post.liked: Post.liked + 1})
+                .where(Post.id == postId)
+                .returning(Post)
+                .execute()
+            )
+            if len(updatedPosts) != 1:
+                transaction.rollback()
+                return {"message": "post not found"}, 404
+            updatedUsers: int = (
+                User.update({User.coins: User.coins + 1})
+                .where(User.id == updatedPosts[0].user)
+                .execute()
+            )
+            if updatedUsers != 1:
+                transaction.rollback()
+                return {"message": "user not found"}, 404
+        else:
+            return {"message": "a valid action is required as GET query string."}, 400
+
+    return {"id": postId}, 201
