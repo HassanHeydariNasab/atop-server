@@ -21,14 +21,18 @@ class BaseModel(Model):
 
 
 class User(BaseModel):
-    countryCode = CharField(null=False)
-    mobile = CharField(null=False)
-    verificationCode = CharField(null=True)
     name = CharField(unique=True, null=False)
     coins = IntegerField(null=False, default=0)
     isActive = BooleanField(default=True)
     isReported = BooleanField(default=False)
     reported = IntegerField(default=0)
+
+
+class Verification(BaseModel):
+    countryCode = CharField(null=False)
+    mobile = CharField(null=False)
+    verificationCode = CharField(null=True)
+    user = ForeignKeyField(User, null=True)
 
     class Meta:
         indexes = ((("countryCode", "mobile"), True),)
@@ -47,7 +51,7 @@ class Post(BaseModel):
 
 def createTables() -> bool:
     try:
-        db.create_tables([User, Post])
+        db.create_tables([User, Verification, Post])
     except Exception as e:
         print(e)
         return False
@@ -56,7 +60,7 @@ def createTables() -> bool:
 
 def dropTables() -> bool:
     try:
-        db.drop_tables([User, Post])
+        db.drop_tables([Verification, User, Post])
     except Exception as e:
         print(e)
         return False

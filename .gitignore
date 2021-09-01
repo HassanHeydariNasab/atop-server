@@ -1,2 +1,5 @@
 atop/configs.py
 __pycache__/
+.vim/.ropeproject/
+.directory
+

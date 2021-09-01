@@ -1,8 +1,7 @@
 import os
 from string import digits
 from random import choices
-from datetime import datetime
-from types import List
+from typing import List
 
 import jwt
 from flask import Flask, request, jsonify, make_response
@@ -15,7 +14,7 @@ from kavenegar import KavenegarAPI, APIException, HTTPException
 from celery import Celery
 
 from .configs import DEBUG, SECRET, KAVENEGAR_APIKEY, KAVENEGAR_VERIFICATION_TEMPLATE
-from .models import User, Post
+from .models import Verification, User, Post
 from .db import db
 from .email import send_email as _send_email
 from .middlewares import auth
@@ -71,7 +70,7 @@ def hello():
     return "hello"
 
 
-@app.route("/v1/users", methods=["POST"])
+@app.route("/v1/verifications", methods=["PUT"])
 @expects_json(
     {
         "type": "object",
@@ -82,20 +81,31 @@ def hello():
         "required": ["countryCode", "mobile"],
     }
 )
-def createUser():
+def upsertVerification():
     j: dict = request.get_json()
     verificationCode: str = "".join(choices(digits, k=4))
+    isUserNew: bool
     try:
-        User.insert(
+        verification: Verification = Verification.get(
+            Verification.countryCode == j["countryCode"],
+            Verification.mobile == j["mobile"],
+        )
+    except Verification.DoesNotExist:
+        isUserNew = True
+        Verification.insert(
             countryCode=j["countryCode"],
             mobile=j["mobile"],
             verificationCode=verificationCode,
-            name="",
-            coins=25,
         ).execute()
-    except IntegrityError as error:
-        return {"message": "database error"}, 409
-
+    else:
+        isUserNew = False
+        updated: int = (
+            Verification.update({Verification.verificationCode: verificationCode})
+            .where(id == verification.id)
+            .execute()
+        )
+        if updated != 1:
+            return {"message": "database error"}, 500
     try:
         api = KavenegarAPI(KAVENEGAR_APIKEY)
         params = {
@@ -116,12 +126,12 @@ def createUser():
     #    return jsonify({"message": "sms failed"}), 500
     except Exception as e:
         print(e)
-        return {}, 201
+        return {"isUserNew": isUserNew}, 201 if isUserNew else 200
 
-    return {}, 201
+    return {"isUserNew": isUserNew}, 201 if isUserNew else 200
 
 
-@app.route("/v1/users/current", methods=["PATCH"])
+@app.route("/v1/users", methods=["PUT"])
 @expects_json(
     {
         "type": "object",
@@ -129,27 +139,53 @@ def createUser():
             "countryCode": {"type": "string", "pattern": r"^\+\d{2,8}$"},
             "mobile": {"type": "string", "pattern": r"^\d{6,24}$"},
             "verificationCode": {"type": "string", "minLength": 1},
+            "name": {"type": "string", "minLength": 1},
         },
         "required": ["countryCode", "mobile", "verificationCode"],
     }
 )
-def verifyUser():
+def upsertUser():
     j: dict = request.get_json()
-    if request.args.get("action") == "verify":
-        try:
-            user: User = User.get(
-                User.countryCode == j["countryCode"],
-                User.mobile == j["mobile"],
-                User.verificationCode == j["verificationCode"],
-            )
-        except User.DoesNotExist:
-            return {"message": "Verification code is not valid."}, 403
-        User.update({User.verificationCode: None}).where(User.id == user.id).execute()
-        token = jwt.encode({"id": user.id}, SECRET, algorithm="HS256")
-        _user = model_to_dict(user)
-        return {"user": _user, "token": token}, 200
+    try:
+        verification: Verification = Verification.get(
+            Verification.countryCode == j["countryCode"],
+            Verification.mobile == j["mobile"],
+            Verification.verificationCode == j["verificationCode"],
+        )
+        print("vu", verification.user)
+    except Verification.DoesNotExist:
+        return {"message": "verification not found."}, 404
+    userId: int
+    if verification.user is None:
+        name: str = j["name"]
+        print("name", name)
+        while True:
+            try:
+                userId = User.insert(name=name, coins=25).execute()
+                print(userId)
+            except IntegrityError:
+                name += "".join(choices(digits, k=8))
+                print("another name", name)
+            except Exception as e:
+                print("EEEEEEEE", e)
+            else:
+                break
+        (
+            Verification.update(user=userId, verificationCode=None)
+            .where(Verification.id == verification.id)
+            .execute()
+        )
+        print(userId, verification.id)
     else:
-        return {"message": "actionis required as GET query string."}, 400
+        userId = verification.user.id
+        (
+            Verification.update(verificationCode=None)
+            .where(Verification.id == verification.id)
+            .execute()
+        )
+
+    token = jwt.encode({"id": userId}, SECRET, algorithm="HS256")
+    return {"token": token}, 201 if verification.user is None else 200
 
 
 @app.route("/v1/users/current", methods=["GET"])
@@ -216,11 +252,11 @@ def showPosts(userId):
 @app.route("/v1/posts/{postId}", methods=["PATCH"])
 @auth
 def editPost(userId, postId):
-    with db.atomic() as transaction:
-        action = request.args.get('action')
-        if (action is None):
-            return {"message": "action is required as GET query string."}, 400
-        if (action == "like"):
+    action = request.args.get("action")
+    if action is None:
+        return {"message": "action is required as GET query string."}, 400
+    if action == "like":
+        with db.atomic as transaction:
             updatedUsers: int = (
                 User.update({User.coins: User.coins - 1})
                 .where(User.id == userId, User.coins >= 1)
@@ -246,7 +282,8 @@ def editPost(userId, postId):
             if updatedUsers != 1:
                 transaction.rollback()
                 return {"message": "user not found"}, 404
-        else:
-            return {"message": "a valid action is required as GET query string."}, 400
+        return {}, 200
+    else:
+        return {"message": "a valid action is required as GET query string."}, 400
 
     return {"id": postId}, 201
