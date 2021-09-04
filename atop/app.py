@@ -101,7 +101,7 @@ def upsertVerification():
         isUserNew = False
         updated: int = (
             Verification.update({Verification.verificationCode: verificationCode})
-            .where(id == verification.id)
+            .where(Verification.id == verification.id)
             .execute()
         )
         if updated != 1:
@@ -244,9 +244,10 @@ def showPosts(userId):
         .where(Post.isActive == True)
         .limit(limit)
         .offset(offset)
+        .order_by(Post.creation_date.desc())
         .dicts()
     )
-    return posts, 200
+    return {"results": posts}, 200
 
 
 @app.route("/v1/posts/{postId}", methods=["PATCH"])
