@@ -2,6 +2,7 @@ from datetime import datetime
 from peewee import (
     Model,
     CharField,
+    TextField,
     AutoField,
     DateTimeField,
     IntegerField,
@@ -13,7 +14,7 @@ from .db import db
 
 class BaseModel(Model):
     id = AutoField()
-    creation_date = DateTimeField(default=datetime.now)
+    creationDate = DateTimeField(default=datetime.utcnow)
 
     class Meta:
         database = db
@@ -24,7 +25,6 @@ class User(BaseModel):
     name = CharField(unique=True, null=False)
     coins = IntegerField(null=False, default=0)
     isActive = BooleanField(default=True)
-    isReported = BooleanField(default=False)
     reported = IntegerField(default=0)
 
 
@@ -40,10 +40,9 @@ class Verification(BaseModel):
 
 class Post(BaseModel):
     user = ForeignKeyField(User)
-    text = CharField(null=False)
+    text = TextField(null=False)
     liked = IntegerField(default=0)
     isActive = BooleanField(default=True)
-    isReported = BooleanField(default=False)
     reported = IntegerField(default=0)
 
     userName = CharField(null=False)  # normalized

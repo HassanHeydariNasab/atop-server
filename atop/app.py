@@ -18,6 +18,7 @@ from .models import Verification, User, Post
 from .db import db
 from .email import send_email as _send_email
 from .middlewares import auth
+from .utils import normalizedMobile
 
 
 app = Flask(__name__)
@@ -88,13 +89,13 @@ def upsertVerification():
     try:
         verification: Verification = Verification.get(
             Verification.countryCode == j["countryCode"],
-            Verification.mobile == j["mobile"],
+            Verification.mobile == normalizedMobile(j["mobile"]),
         )
     except Verification.DoesNotExist:
         isUserNew = True
         Verification.insert(
             countryCode=j["countryCode"],
-            mobile=j["mobile"],
+            mobile=normalizedMobile(j["mobile"]),
             verificationCode=verificationCode,
         ).execute()
     else:
@@ -109,7 +110,7 @@ def upsertVerification():
     try:
         api = KavenegarAPI(KAVENEGAR_APIKEY)
         params = {
-            "receptor": j["countryCode"] + j["mobile"],
+            "receptor": j["countryCode"] + normalizedMobile(j["mobile"]),
             "token": verificationCode,
             "template": KAVENEGAR_VERIFICATION_TEMPLATE,
         }
@@ -149,12 +150,11 @@ def upsertUser():
     try:
         verification: Verification = Verification.get(
             Verification.countryCode == j["countryCode"],
-            Verification.mobile == j["mobile"],
+            Verification.mobile == normalizedMobile(j["mobile"]),
             Verification.verificationCode == j["verificationCode"],
         )
-        print("vu", verification.user)
     except Verification.DoesNotExist:
-        return {"message": "verification not found."}, 404
+        return {"message": "verification code is invalid."}, 404
     userId: int
     if verification.user is None:
         name: str = j["name"]
@@ -194,7 +194,7 @@ def showUser(userId):
     try:
         user: User = User.get(User.id == userId)
     except User.DoesNotExist:  # noqa: E722
-        return {"message": "not found"}, 404
+        return {"message": "token is invalid."}, 401
 
     _user: dict = model_to_dict(user)
 
@@ -240,24 +240,27 @@ def showPosts(userId):
     except ValueError:
         return {"message": "limit or offset is invalid."}, 400
     posts: List[Post] = list(
-        Post.select(Post.userName, Post.user, Post.text, Post.liked)
-        .where(Post.isActive == True)
+        Post.select(
+            Post.id, Post.userName, Post.user, Post.text, Post.liked, Post.creationDate
+        )
+        .where(Post.isActive == True)  # noqa E712
         .limit(limit)
         .offset(offset)
-        .order_by(Post.creation_date.desc())
+        .order_by(Post.liked.desc(), Post.creationDate.desc())
         .dicts()
     )
+    print(posts)
     return {"results": posts}, 200
 
 
-@app.route("/v1/posts/{postId}", methods=["PATCH"])
+@app.route("/v1/posts/<postId>", methods=["PATCH"])
 @auth
 def editPost(userId, postId):
     action = request.args.get("action")
     if action is None:
         return {"message": "action is required as GET query string."}, 400
     if action == "like":
-        with db.atomic as transaction:
+        with db.atomic() as transaction:
             updatedUsers: int = (
                 User.update({User.coins: User.coins - 1})
                 .where(User.id == userId, User.coins >= 1)
@@ -283,7 +286,7 @@ def editPost(userId, postId):
             if updatedUsers != 1:
                 transaction.rollback()
                 return {"message": "user not found"}, 404
-        return {}, 200
+        return {"liked": updatedPosts[0].liked}, 200
     else:
         return {"message": "a valid action is required as GET query string."}, 400
 
